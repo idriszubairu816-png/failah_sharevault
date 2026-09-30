@@ -1,0 +1,115 @@
+// lib/features/vault/models/vault_item_model.dart
+//
+// FAILAH ShareVault — Vault Item Metadata Model
+//
+// This is the Hive-persisted record describing a single file stored in the
+// encrypted vault. It never contains plaintext file bytes — only metadata
+// plus a pointer (`encryptedPath`) to the AES-256-GCM encrypted blob on
+// disk, and a `checksumHash` used to verify integrity after decryption.
+
+import 'package:hive/hive.dart';
+
+part 'vault_item_model.g.dart';
+
+/// Hive type id for [VaultItemModel]. Must stay unique across the whole
+/// app's Hive type registry — reserved range for `features/vault` is 10-19.
+const int vaultItemModelTypeId = 10;
+
+@HiveType(typeId: vaultItemModelTypeId)
+class VaultItemModel extends HiveObject {
+  VaultItemModel({
+    required this.id,
+    required this.originalName,
+    required this.encryptedPath,
+    required this.fileSizeBytes,
+    required this.dateAdded,
+    required this.fileType,
+    required this.checksumHash,
+  });
+
+  /// Stable unique identifier for this vault entry (not a filename).
+  @HiveField(0)
+  final String id;
+
+  /// The file's original, human-readable name as it existed before being
+  /// imported into the vault (e.g. "passport_scan.pdf").
+  @HiveField(1)
+  final String originalName;
+
+  /// Absolute path to the obfuscated, AES-256-GCM encrypted blob on disk.
+  /// This filename is intentionally unrelated to [originalName].
+  @HiveField(2)
+  final String encryptedPath;
+
+  /// Size, in bytes, of the original plaintext file (not the encrypted
+  /// blob, which is slightly larger due to per-chunk framing overhead).
+  @HiveField(3)
+  final int fileSizeBytes;
+
+  /// Timestamp when the file was imported into the vault.
+  @HiveField(4)
+  final DateTime dateAdded;
+
+  /// Category/type label for UI grouping (e.g. "Images", "Documents").
+  /// Expected to align with the category constants in `AppStrings`.
+  @HiveField(5)
+  final String fileType;
+
+  /// SHA-256 checksum (hex) of the original plaintext file, computed at
+  /// import time. Used to verify integrity whenever the file is exported
+  /// back out of the vault.
+  @HiveField(6)
+  final String checksumHash;
+
+  /// Returns a copy of this record with the given fields replaced.
+  VaultItemModel copyWith({
+    String? id,
+    String? originalName,
+    String? encryptedPath,
+    int? fileSizeBytes,
+    DateTime? dateAdded,
+    String? fileType,
+    String? checksumHash,
+  }) {
+    return VaultItemModel(
+      id: id ?? this.id,
+      originalName: originalName ?? this.originalName,
+      encryptedPath: encryptedPath ?? this.encryptedPath,
+      fileSizeBytes: fileSizeBytes ?? this.fileSizeBytes,
+      dateAdded: dateAdded ?? this.dateAdded,
+      fileType: fileType ?? this.fileType,
+      checksumHash: checksumHash ?? this.checksumHash,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'VaultItemModel(id: $id, originalName: $originalName, '
+        'fileSizeBytes: $fileSizeBytes, fileType: $fileType, '
+        'dateAdded: $dateAdded)';
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is VaultItemModel &&
+        other.id == id &&
+        other.originalName == originalName &&
+        other.encryptedPath == encryptedPath &&
+        other.fileSizeBytes == fileSizeBytes &&
+        other.dateAdded == dateAdded &&
+        other.fileType == fileType &&
+        other.checksumHash == checksumHash;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        id,
+        originalName,
+        encryptedPath,
+        fileSizeBytes,
+        dateAdded,
+        fileType,
+        checksumHash,
+      );
+}

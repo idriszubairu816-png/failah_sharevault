@@ -1,0 +1,605 @@
+// lib/core/security/vault_security_service.dart
+//
+// FAILAH ShareVault — Vault Security Service
+//
+// Responsibilities:
+//   1. Biometric (fingerprint / face) authentication via `local_auth`.
+//   2. PIN lifecycle: salted SHA-256 hashing, secure storage, verification.
+//   3. Streaming SHA-256 checksums for file integrity verification.
+//   4. Chunked AES-256-GCM authenticated encryption/decryption for vault
+//      files, so files of arbitrary size can be processed without loading
+//      the entire plaintext or ciphertext into memory at once.
+//
+// Security notes:
+//   - The vault master key is a random 256-bit key generated once on first
+//     use and persisted in the platform keystore/keychain via
+//     `flutter_secure_storage`. It never leaves the device.
+//   - Each chunk is encrypted with AES-256-GCM using a unique 96-bit nonce
+//     (8-byte random file prefix + 4-byte big-endian chunk counter), so no
+//     nonce is ever reused for a given key.
+//   - GCM provides authenticated encryption: any tampering with ciphertext
+//     causes decryption to throw, which is surfaced as
+//     [VaultIntegrityException].
+//   - PIN comparisons are done in constant time to reduce timing side
+//     channels.
+
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+import 'package:encrypt/encrypt.dart' as enc;
+import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:local_auth/local_auth.dart';
+
+// ===========================================================================
+// EXCEPTIONS
+// ===========================================================================
+
+/// Thrown when biometric or PIN authentication fails or is unavailable.
+class VaultAuthException implements Exception {
+  const VaultAuthException(this.message, {this.code});
+
+  final String message;
+  final String? code;
+
+  @override
+  String toString() => 'VaultAuthException($code): $message';
+}
+
+/// Thrown when a decrypted file fails its integrity/authenticity check
+/// (corrupted, truncated, or tampered ciphertext).
+class VaultIntegrityException implements Exception {
+  const VaultIntegrityException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'VaultIntegrityException: $message';
+}
+
+// ===========================================================================
+// VAULT SECURITY SERVICE
+// ===========================================================================
+
+class VaultSecurityService {
+  VaultSecurityService({
+    FlutterSecureStorage? secureStorage,
+    LocalAuthentication? localAuth,
+  })  : _secureStorage = secureStorage ??
+            const FlutterSecureStorage(
+              aOptions: AndroidOptions(encryptedSharedPreferences: true),
+              iOptions: IOSOptions(
+                accessibility: KeychainAccessibility.first_unlock_this_device,
+              ),
+            ),
+        _localAuth = localAuth ?? LocalAuthentication();
+
+  final FlutterSecureStorage _secureStorage;
+  final LocalAuthentication _localAuth;
+
+  // ---------------------------------------------------------------------
+  // SECURE STORAGE KEYS
+  // ---------------------------------------------------------------------
+
+  static const String _kMasterKey = 'vault_master_key_v1';
+  static const String _kPinHash = 'vault_pin_hash_v1';
+  static const String _kPinSalt = 'vault_pin_salt_v1';
+  static const String _kPinSet = 'vault_pin_is_set_v1';
+  static const String _kBiometricEnabled = 'vault_biometric_enabled_v1';
+
+  // ---------------------------------------------------------------------
+  // FILE FORMAT CONSTANTS
+  // ---------------------------------------------------------------------
+
+  /// 4-byte magic header identifying a FAILAH ShareVault encrypted blob.
+  static final Uint8List _kMagic =
+      Uint8List.fromList(utf8.encode('FLVT'));
+
+  /// Container format version — bump if the framing changes.
+  static const int _kFormatVersion = 1;
+
+  /// Length, in bytes, of the random per-file nonce prefix.
+  static const int _kNoncePrefixLength = 8;
+
+  /// Length, in bytes, of the per-chunk counter appended to the nonce
+  /// prefix to form the full 96-bit (12-byte) GCM nonce.
+  static const int _kNonceCounterLength = 4;
+
+  /// Default plaintext chunk size: 1 MiB. Large enough for good throughput,
+  /// small enough to bound peak memory usage regardless of file size.
+  static const int _kDefaultChunkSize = 1024 * 1024;
+
+  final Random _secureRandom = Random.secure();
+
+  // =======================================================================
+  // BIOMETRIC AUTHENTICATION
+  // =======================================================================
+
+  /// Whether this device is capable of biometric authentication at all
+  /// (hardware present and OS-level support), regardless of enrollment.
+  Future<bool> isDeviceSupported() async {
+    try {
+      return await _localAuth.isDeviceSupported();
+    } on PlatformException catch (e) {
+      throw VaultAuthException(
+        'Unable to determine device biometric support.',
+        code: e.code,
+      );
+    }
+  }
+
+  /// Whether the device currently has usable biometrics enrolled
+  /// (fingerprint registered, face enrolled, etc.).
+  Future<bool> canCheckBiometrics() async {
+    try {
+      final supported = await _localAuth.isDeviceSupported();
+      final canCheck = await _localAuth.canCheckBiometrics;
+      return supported && canCheck;
+    } on PlatformException catch (e) {
+      throw VaultAuthException(
+        'Unable to query biometric capability.',
+        code: e.code,
+      );
+    }
+  }
+
+  /// Returns the list of biometric types enrolled on the device
+  /// (e.g. face, fingerprint, iris).
+  Future<List<BiometricType>> getAvailableBiometrics() async {
+    try {
+      return await _localAuth.getAvailableBiometrics();
+    } on PlatformException catch (e) {
+      throw VaultAuthException(
+        'Unable to fetch available biometrics.',
+        code: e.code,
+      );
+    }
+  }
+
+  /// Prompts the OS-native biometric UI. Returns `true` only when the user
+  /// successfully authenticates. Throws [VaultAuthException] for
+  /// unrecoverable states (not enrolled, locked out, no passcode set).
+  Future<bool> authenticateWithBiometrics({
+    String reason = 'Authenticate to access your FAILAH ShareVault',
+    bool allowDeviceCredentialFallback = true,
+  }) async {
+    try {
+      final didAuthenticate = await _localAuth.authenticate(
+        localizedReason: reason,
+        options: AuthenticationOptions(
+          biometricOnly: !allowDeviceCredentialFallback,
+          stickyAuth: true,
+          useErrorDialogs: true,
+        ),
+      );
+      return didAuthenticate;
+    } on PlatformException catch (e) {
+      switch (e.code) {
+        case 'NotEnrolled':
+          throw const VaultAuthException(
+            'No biometrics are enrolled on this device.',
+            code: 'NotEnrolled',
+          );
+        case 'LockedOut':
+          throw const VaultAuthException(
+            'Too many failed attempts. Biometrics temporarily locked.',
+            code: 'LockedOut',
+          );
+        case 'PermanentlyLockedOut':
+          throw const VaultAuthException(
+            'Biometrics are permanently locked. Use your device passcode.',
+            code: 'PermanentlyLockedOut',
+          );
+        case 'PasscodeNotSet':
+          throw const VaultAuthException(
+            'No device passcode is set. Please secure your device first.',
+            code: 'PasscodeNotSet',
+          );
+        default:
+          throw VaultAuthException(
+            e.message ?? 'Biometric authentication failed.',
+            code: e.code,
+          );
+      }
+    }
+  }
+
+  /// Persists whether the user has opted into biometric unlock for the
+  /// vault. Purely a UX preference flag — the actual authentication check
+  /// always goes through [authenticateWithBiometrics].
+  Future<void> setBiometricEnabled(bool enabled) async {
+    await _secureStorage.write(
+      key: _kBiometricEnabled,
+      value: enabled.toString(),
+    );
+  }
+
+  Future<bool> isBiometricEnabled() async {
+    final value = await _secureStorage.read(key: _kBiometricEnabled);
+    return value == 'true';
+  }
+
+  // =======================================================================
+  // PIN MANAGEMENT (Salted SHA-256)
+  // =======================================================================
+
+  /// Sets (or replaces) the vault PIN. The PIN itself is never stored —
+  /// only a random salt and the SHA-256 hash of `salt || pin`.
+  Future<void> setPin(String pin) async {
+    if (pin.length < 4) {
+      throw const VaultAuthException(
+        'PIN must be at least 4 digits long.',
+        code: 'PinTooShort',
+      );
+    }
+
+    final salt = _generateRandomBytes(16);
+    final hash = _hashPin(pin, salt);
+
+    await _secureStorage.write(key: _kPinSalt, value: base64Encode(salt));
+    await _secureStorage.write(key: _kPinHash, value: hash);
+    await _secureStorage.write(key: _kPinSet, value: 'true');
+  }
+
+  /// Returns `true` if a vault PIN has previously been configured.
+  Future<bool> hasPinSet() async {
+    final flag = await _secureStorage.read(key: _kPinSet);
+    return flag == 'true';
+  }
+
+  /// Verifies a candidate PIN against the stored salted hash using a
+  /// constant-time comparison to mitigate timing side-channel attacks.
+  Future<bool> verifyPin(String pin) async {
+    final saltB64 = await _secureStorage.read(key: _kPinSalt);
+    final storedHash = await _secureStorage.read(key: _kPinHash);
+
+    if (saltB64 == null || storedHash == null) {
+      throw const VaultAuthException(
+        'No PIN has been configured for this vault.',
+        code: 'PinNotSet',
+      );
+    }
+
+    final salt = base64Decode(saltB64);
+    final candidateHash = _hashPin(pin, salt);
+
+    return _constantTimeEquals(candidateHash, storedHash);
+  }
+
+  /// Removes the configured PIN entirely (e.g. user resets vault security).
+  /// This does NOT touch the master encryption key or existing vault files.
+  Future<void> clearPin() async {
+    await _secureStorage.delete(key: _kPinSalt);
+    await _secureStorage.delete(key: _kPinHash);
+    await _secureStorage.delete(key: _kPinSet);
+  }
+
+  String _hashPin(String pin, List<int> salt) {
+    final bytes = <int>[...salt, ...utf8.encode(pin)];
+    return sha256.convert(bytes).toString();
+  }
+
+  /// Compares two equal-length hex strings in constant time. Falls back to
+  /// a length check first (length itself is not considered sensitive here
+  /// since SHA-256 hex digests are always 64 characters).
+  bool _constantTimeEquals(String a, String b) {
+    if (a.length != b.length) return false;
+    var result = 0;
+    for (var i = 0; i < a.length; i++) {
+      result |= a.codeUnitAt(i) ^ b.codeUnitAt(i);
+    }
+    return result == 0;
+  }
+
+  // =======================================================================
+  // FILE INTEGRITY: STREAMING SHA-256 CHECKSUM
+  // =======================================================================
+
+  /// Computes the SHA-256 checksum of [file] by streaming its contents in
+  /// chunks, so memory usage stays constant regardless of file size.
+  ///
+  /// Returns the checksum as a lowercase hex string.
+  Future<String> calculateFileChecksum(File file) async {
+    if (!await file.exists()) {
+      throw VaultIntegrityException(
+        'Cannot checksum a file that does not exist: ${file.path}',
+      );
+    }
+
+    final outputSink = AccumulatorSink<Digest>();
+    final inputSink = sha256.startChunkedConversion(outputSink);
+
+    try {
+      await for (final chunk in file.openRead()) {
+        inputSink.add(chunk);
+      }
+    } finally {
+      inputSink.close();
+    }
+
+    return outputSink.events.single.toString();
+  }
+
+  /// Convenience helper: verifies that [file] matches an [expectedChecksum]
+  /// (as produced by [calculateFileChecksum]).
+  Future<bool> verifyFileChecksum(File file, String expectedChecksum) async {
+    final actual = await calculateFileChecksum(file);
+    return _constantTimeEquals(actual, expectedChecksum);
+  }
+
+  // =======================================================================
+  // MASTER ENCRYPTION KEY
+  // =======================================================================
+
+  /// Retrieves the vault's AES-256 master key, generating and persisting a
+  /// new random one on first use. Stored in the OS-backed secure
+  /// storage (Android Keystore-backed EncryptedSharedPreferences /
+  /// iOS Keychain), never in plaintext app storage.
+  Future<enc.Key> _getOrCreateMasterKey() async {
+    final existing = await _secureStorage.read(key: _kMasterKey);
+    if (existing != null) {
+      return enc.Key(base64Decode(existing));
+    }
+
+    final keyBytes = _generateRandomBytes(32); // 256-bit key
+    await _secureStorage.write(key: _kMasterKey, value: base64Encode(keyBytes));
+    return enc.Key(Uint8List.fromList(keyBytes));
+  }
+
+  /// Returns `true` if a master vault key already exists on this device.
+  Future<bool> hasMasterKey() async {
+    final existing = await _secureStorage.read(key: _kMasterKey);
+    return existing != null;
+  }
+
+  /// Permanently destroys the master encryption key. Any files previously
+  /// encrypted with it become unrecoverable. Use only for a full vault
+  /// wipe, paired with deleting all encrypted files on disk.
+  Future<void> destroyMasterKey() async {
+    await _secureStorage.delete(key: _kMasterKey);
+  }
+
+  // =======================================================================
+  // AES-256-GCM CHUNKED FILE ENCRYPTION / DECRYPTION
+  // =======================================================================
+
+  /// Encrypts [sourceFile] into [destinationFile] using AES-256-GCM,
+  /// streaming the plaintext in fixed-size chunks so the whole file is
+  /// never held in memory at once.
+  ///
+  /// Container framing (all integers big-endian):
+  ///   [4 bytes]  magic "FLVT"
+  ///   [1 byte]   format version
+  ///   [8 bytes]  random nonce prefix (unique per file)
+  ///   [4 bytes]  plaintext chunk size used for this file
+  ///   repeated:
+  ///     [4 bytes] chunk index
+  ///     [4 bytes] ciphertext length (includes 16-byte GCM tag)
+  ///     [N bytes] ciphertext || tag
+  Future<void> encryptFile(
+    File sourceFile,
+    File destinationFile, {
+    int chunkSize = _kDefaultChunkSize,
+  }) async {
+    if (!await sourceFile.exists()) {
+      throw VaultIntegrityException(
+        'Source file does not exist: ${sourceFile.path}',
+      );
+    }
+
+    final key = await _getOrCreateMasterKey();
+    final noncePrefix = _generateRandomBytes(_kNoncePrefixLength);
+
+    await destinationFile.parent.create(recursive: true);
+    final sink = destinationFile.openWrite();
+
+    try {
+      // --- Header ---
+      sink.add(_kMagic);
+      sink.add([_kFormatVersion]);
+      sink.add(noncePrefix);
+      sink.add(_uint32BE(chunkSize));
+
+      final reader = _ChunkedByteReader(sourceFile.openRead());
+      final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.gcm));
+
+      var chunkIndex = 0;
+      Uint8List? chunk;
+
+      while ((chunk = await reader.readExactly(chunkSize)) != null) {
+        final nonce = Uint8List.fromList(
+          [...noncePrefix, ..._uint32BE(chunkIndex)],
+        );
+        final iv = enc.IV(nonce);
+
+        final encrypted = encrypter.encryptBytes(chunk!, iv: iv);
+        final cipherBytes = encrypted.bytes;
+
+        sink.add(_uint32BE(chunkIndex));
+        sink.add(_uint32BE(cipherBytes.length));
+        sink.add(cipherBytes);
+
+        chunkIndex++;
+      }
+
+      await sink.flush();
+    } finally {
+      await sink.close();
+    }
+  }
+
+  /// Decrypts a file previously produced by [encryptFile] back into
+  /// plaintext at [destinationFile], streaming chunk-by-chunk.
+  ///
+  /// Throws [VaultIntegrityException] if the header is malformed or if any
+  /// chunk fails GCM authentication (indicating corruption or tampering).
+  Future<void> decryptFile(
+    File encryptedFile,
+    File destinationFile,
+  ) async {
+    if (!await encryptedFile.exists()) {
+      throw VaultIntegrityException(
+        'Encrypted file does not exist: ${encryptedFile.path}',
+      );
+    }
+
+    final key = await _getOrCreateMasterKey();
+    final reader = _ChunkedByteReader(encryptedFile.openRead());
+
+    // --- Header ---
+    final magic = await reader.readExactly(4);
+    if (magic == null || !_bytesEqual(magic, _kMagic)) {
+      throw const VaultIntegrityException(
+        'Not a valid FAILAH ShareVault encrypted file (bad magic header).',
+      );
+    }
+
+    final versionByte = await reader.readExactly(1);
+    if (versionByte == null || versionByte[0] != _kFormatVersion) {
+      throw const VaultIntegrityException(
+        'Unsupported vault file format version.',
+      );
+    }
+
+    final noncePrefix = await reader.readExactly(_kNoncePrefixLength);
+    if (noncePrefix == null || noncePrefix.length != _kNoncePrefixLength) {
+      throw const VaultIntegrityException(
+        'Corrupted vault file header (nonce prefix).',
+      );
+    }
+
+    final chunkSizeBytes = await reader.readExactly(4);
+    if (chunkSizeBytes == null || chunkSizeBytes.length != 4) {
+      throw const VaultIntegrityException(
+        'Corrupted vault file header (chunk size).',
+      );
+    }
+
+    await destinationFile.parent.create(recursive: true);
+    final sink = destinationFile.openWrite();
+    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.gcm));
+
+    try {
+      while (true) {
+        final indexBytes = await reader.readExactly(4);
+        if (indexBytes == null) break; // Clean end of stream.
+        if (indexBytes.length != 4) {
+          throw const VaultIntegrityException(
+            'Corrupted vault file: truncated chunk index.',
+          );
+        }
+
+        final lengthBytes = await reader.readExactly(4);
+        if (lengthBytes == null || lengthBytes.length != 4) {
+          throw const VaultIntegrityException(
+            'Corrupted vault file: truncated chunk length.',
+          );
+        }
+        final cipherLength = _bytesToUint32BE(lengthBytes);
+
+        final cipherBytes = await reader.readExactly(cipherLength);
+        if (cipherBytes == null || cipherBytes.length != cipherLength) {
+          throw const VaultIntegrityException(
+            'Corrupted vault file: truncated ciphertext chunk.',
+          );
+        }
+
+        final chunkIndex = _bytesToUint32BE(indexBytes);
+        final nonce = Uint8List.fromList(
+          [...noncePrefix, ..._uint32BE(chunkIndex)],
+        );
+        final iv = enc.IV(nonce);
+
+        try {
+          final decrypted = encrypter.decryptBytes(
+            enc.Encrypted(cipherBytes),
+            iv: iv,
+          );
+          sink.add(decrypted);
+        } catch (_) {
+          throw const VaultIntegrityException(
+            'Chunk failed authentication — file is corrupted or tampered '
+            'with.',
+          );
+        }
+      }
+
+      await sink.flush();
+    } finally {
+      await sink.close();
+    }
+  }
+
+  // =======================================================================
+  // BYTE / INTEGER HELPERS
+  // =======================================================================
+
+  List<int> _generateRandomBytes(int length) {
+    return List<int>.generate(length, (_) => _secureRandom.nextInt(256));
+  }
+
+  Uint8List _uint32BE(int value) {
+    final bytes = ByteData(4)..setUint32(0, value, Endian.big);
+    return bytes.buffer.asUint8List();
+  }
+
+  int _bytesToUint32BE(List<int> bytes) {
+    final data = ByteData.sublistView(Uint8List.fromList(bytes));
+    return data.getUint32(0, Endian.big);
+  }
+
+  bool _bytesEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+}
+
+// ===========================================================================
+// INTERNAL: EXACT-SIZE CHUNKED STREAM READER
+// ===========================================================================
+
+/// Wraps a `Stream<List<int>>` (as produced by `File.openRead()`) and
+/// exposes [readExactly], which pulls precisely `n` bytes at a time
+/// regardless of the underlying stream's natural chunk boundaries.
+///
+/// This is what makes true fixed-size-chunk streaming encryption possible:
+/// without it, `File.openRead()` may deliver arbitrarily sized packets that
+/// don't line up with the logical chunk size used for AES-GCM framing.
+class _ChunkedByteReader {
+  _ChunkedByteReader(Stream<List<int>> stream)
+      : _iterator = StreamIterator<List<int>>(stream);
+
+  final StreamIterator<List<int>> _iterator;
+  final List<int> _buffer = <int>[];
+  bool _upstreamDone = false;
+
+  /// Reads exactly [n] bytes, or fewer if the stream ends first.
+  /// Returns `null` only when there is nothing left to read at all.
+  Future<Uint8List?> readExactly(int n) async {
+    while (_buffer.length < n && !_upstreamDone) {
+      final hasMore = await _iterator.moveNext();
+      if (hasMore) {
+        _buffer.addAll(_iterator.current);
+      } else {
+        _upstreamDone = true;
+      }
+    }
+
+    if (_buffer.isEmpty) {
+      return null;
+    }
+
+    final takeCount = n < _buffer.length ? n : _buffer.length;
+    final result = Uint8List.fromList(_buffer.sublist(0, takeCount));
+    _buffer.removeRange(0, takeCount);
+    return result;
+  }
+
+  Future<void> cancel() => _iterator.cancel();
+}
